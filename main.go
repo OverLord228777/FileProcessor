@@ -1,11 +1,12 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"flag"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -44,80 +45,137 @@ func (h *History) Exists(hash string) bool {
 	return h.hashes[hash]
 }
 
+// Processor описывает контракт для плагинов обработки содержимого.
+type Processor interface {
+	Process(fileData []byte) (string, error)
+}
+
+// LineCounter подсчитывает количество строк в данных.
+type LineCounter struct{}
+
+func (l LineCounter) Process(data []byte) (string, error) {
+	count := bytes.Count(data, []byte("\n"))
+	// Если последняя строка не заканчивается \n, она всё равно считается строкой
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		count++
+	}
+	return fmt.Sprintf("Number of lines: %d", count), nil
+}
+
+// WordCounter подсчитывает количество слов в данных.
+type WordCounter struct{}
+
+func (w WordCounter) Process(data []byte) (string, error) {
+	words := strings.Fields(string(data))
+	return fmt.Sprintf("Number of words: %d", len(words)), nil
+}
+
+// Checksummer вычисляет SHA-256 хэш содержимого.
+type Checksummer struct{}
+
+func (c Checksummer) Process(data []byte) (string, error) {
+	hash := sha256.Sum256(data)
+	return "SHA256: " + hex.EncodeToString(hash[:]), nil
+}
+
+// GzipCompressor сжимает данные и возвращает размер после сжатия.
+type GzipCompressor struct{}
+
+func (g GzipCompressor) Process(data []byte) (string, error) {
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		return "", fmt.Errorf("gzip write error: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return "", fmt.Errorf("gzip close error: %w", err)
+	}
+	return fmt.Sprintf("Compressed size: %d bytes", buf.Len()), nil
+}
+
+// Report генерирует отчёт о результате обработки файла.
+type Report struct{}
+
+func (r Report) Generate(fileName string, result string) {
+	fmt.Printf("===== Report =====\n")
+	fmt.Printf("File: %s\n", fileName)
+	fmt.Printf("Result:\n%s\n", result)
+	fmt.Printf("==================\n")
+}
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Использование: program <путь_к_файлу>")
-		return
+	// Определяем флаг режима
+	mode := flag.String("mode", "", "режим обработки: lines, words, hash, compress")
+	flag.Parse()
+
+	// Проверка, что режим указан
+	if *mode == "" {
+		fmt.Println("Укажите режим через -mode (lines, words, hash, compress)")
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	filepath := os.Args[1]
-	file, err := os.Open(filepath)
+	// Получаем путь к файлу из не-флаговых аргументов
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Println("Укажите путь к файлу для обработки")
+		os.Exit(1)
+	}
+	filePath := args[0]
+
+	// Читаем всё содержимое файла в память (для удобства передачи в процессор)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		fmt.Printf("Ошибка открытия файла: %v\n", err)
-		return
-	}
-	defer file.Close()
-
-	// Получаем размер файла (может понадобиться для FileInfo)
-	fileInfo, err := file.Stat()
-	if err != nil {
-		fmt.Printf("Ошибка получения информации о файле: %v\n", err)
-		return
-	}
-	fileSize := fileInfo.Size()
-
-	// Вычисляем SHA-256 хэш содержимого
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		fmt.Printf("Ошибка вычисления хэша: %v\n", err)
-		return
-	}
-	hash := hex.EncodeToString(hasher.Sum(nil))
-
-	// Возвращаем указатель чтения в начало файла
-	if _, err := file.Seek(0, 0); err != nil {
-		fmt.Printf("Ошибка перемещения по файлу: %v\n", err)
-		return
+		fmt.Printf("Ошибка чтения файла: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Инициализируем историю (в памяти на время выполнения)
+	// Вычисляем хэш всего содержимого для проверки истории
+	hash := sha256.Sum256(data)
+	hashStr := hex.EncodeToString(hash[:])
+
+	// История (пока только в памяти на время выполнения)
 	history := &History{
 		files:  make([]FileInfo, 0),
 		hashes: make(map[string]bool),
 	}
 
-	// Проверяем, обрабатывался ли файл ранее
-	if history.Exists(hash) {
-		fmt.Printf("Файл %s уже был обработан ранее (хэш: %s). Пропускаем.\n", filepath, hash)
+	if history.Exists(hashStr) {
+		fmt.Printf("Файл %s уже был обработан ранее (хэш: %s). Пропускаем.\n", filePath, hashStr)
 		return
 	}
 
-	// Подсчёт строк и слов
-	var lineCount, wordCount int
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		lineCount++
-		line := scanner.Text()
-		wordCount += len(strings.Fields(line))
+	// Хранилище процессоров
+	processors := map[string]Processor{
+		"lines":    LineCounter{},
+		"words":    WordCounter{},
+		"hash":     Checksummer{},
+		"compress": GzipCompressor{},
 	}
 
-	if err := scanner.Err(); err != nil {
-		fmt.Printf("Ошибка при чтении: %v\n", err)
-		return
+	processor, ok := processors[*mode]
+	if !ok {
+		fmt.Printf("Неизвестный режим: %s. Доступны: lines, words, hash, compress\n", *mode)
+		os.Exit(1)
 	}
 
-	// Добавляем запись в историю
+	// Выполняем обработку
+	result, err := processor.Process(data)
+	if err != nil {
+		fmt.Printf("Ошибка обработки: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Добавляем файл в историю (запоминаем факт обработки)
+	fileInfo, _ := os.Stat(filePath)
 	history.Add(FileInfo{
-		Path:        filepath,
-		Size:        fileSize,
-		Hash:        hash,
+		Path:        filePath,
+		Size:        fileInfo.Size(),
+		Hash:        hashStr,
 		ProcessedAt: time.Now(),
 	})
 
-	// Выводим статистику
-	fmt.Printf("Файл: %s\n", filepath)
-	fmt.Printf("Размер: %d байт\n", fileSize)
-	fmt.Printf("Количество строк: %d\n", lineCount)
-	fmt.Printf("Количество слов: %d\n", wordCount)
+	// Генерируем отчёт
+	var report Report
+	report.Generate(filePath, result)
 }
